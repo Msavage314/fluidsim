@@ -2,14 +2,13 @@ use std::{cmp, f32::consts::PI};
 
 use macroquad::{math, prelude::*};
 
-const GRAVITY: f32 = -0.0;
-const POINT_RADIUS: f32 = 5.0;
+const GRAVITY: f32 = 0.0;
+const POINT_RADIUS: f32 = 8.0;
 const RESTITUTION: f32 = 0.9;
 const BORDER: f32 = 5.0;
-const SMOOTHING_RADIUS: f32 = 5.0;
 const PIXELS_PER_UNIT: f32 = 100.0;
-const TARGET_DENSITY: f32 = 10.0;
-const PRESSURE_MULTIPLIER: f32 = 1.0;
+const TARGET_DENSITY: f32 = 5.0;
+const PRESSURE_MULTIPLIER: f32 = 10.0;
 const MASS: f32 = 1.0;
 struct Boundary {
     x_min: f32,
@@ -83,8 +82,7 @@ impl Simulation {
         self.update_densities(smoothing_radius);
 
         for i in 0..self.positions.len() {
-            let pressureForce =
-                self.calculate_pressure_gradient(self.positions[i], smoothing_radius);
+            let pressureForce = self.calculate_pressure_gradient(i, smoothing_radius);
             let pressure_acceleration = pressureForce / self.densities[i];
             self.velocities[i] -= pressure_acceleration
         }
@@ -128,17 +126,18 @@ impl Simulation {
         }
     }
     fn smoothing_kernel(radius: f32, dst: f32) -> f32 {
-        let volume = PI * radius.powf(8.0) / 4.0;
-        let value = f32::max(0.0, radius * radius - dst * dst);
-        return value * value * value / volume;
+        if dst >= radius {
+            return 0.0;
+        }
+        let volume = PI * radius.powf(4.0) / 6.0;
+        return (radius - dst) * (radius - dst) / volume;
     }
     fn smoothing_kernel_derivative(radius: f32, dst: f32) -> f32 {
         if (dst >= radius) {
             return 0.0;
         }
-        let f = radius * radius - dst * dst;
-        let scale = -24.0 / (PI * radius.powf(8.0));
-        return scale * dst * f * f;
+        let scale = 12.0 / (PI * radius.powf(4.0));
+        return (dst - radius) * scale;
     }
     fn convert_density_to_pressure(density: f32) -> f32 {
         let density_error = density - TARGET_DENSITY;
@@ -155,13 +154,21 @@ impl Simulation {
             density + MASS * Simulation::smoothing_kernel(scaled_radius, dst)
         })
     }
-    fn calculate_pressure_gradient(&self, sample_point: Vec2, smoothing_radius: f32) -> Vec2 {
+    fn calculate_shared_pressure(density_a: f32, density_b: f32) -> f32 {
+        let pressure_a = Simulation::convert_density_to_pressure(density_a);
+        let pressure_b = Simulation::convert_density_to_pressure(density_b);
+        return (pressure_a + pressure_b) / 2.0;
+    }
+    fn calculate_pressure_gradient(
+        &self,
+        sample_point_index: usize,
+        smoothing_radius: f32,
+    ) -> Vec2 {
         let mut pressure = Vec2::ZERO;
         let scale = 1.0 / PIXELS_PER_UNIT;
         let scaled_radius = smoothing_radius * scale;
-
         for i in 0..self.positions.len() {
-            let offset = self.positions[i] - sample_point;
+            let offset = self.positions[i] - self.positions[sample_point_index];
             let dst = offset.length() * scale;
             if dst == 0.0 {
                 continue;
@@ -169,8 +176,9 @@ impl Simulation {
             let dir = offset.normalize();
             let slope = Simulation::smoothing_kernel_derivative(scaled_radius, dst);
             let density = self.densities[i];
-            pressure +=
-                -Simulation::convert_density_to_pressure(density) * dir * slope * MASS / density;
+            let shared_pressure =
+                Simulation::calculate_shared_pressure(density, self.densities[sample_point_index]);
+            pressure += -shared_pressure * dir * slope * MASS / density;
         }
         return pressure;
     }
@@ -179,7 +187,7 @@ impl Simulation {
 #[macroquad::main("FluidSim")]
 async fn main() {
     let bounds = Boundary::from_screen();
-    let mut sim = Simulation::new_grid(20, 20, 20.0);
+    let mut sim = Simulation::new_random(500, &bounds);
     let mut smoothing_radius: f32 = 50.0;
     loop {
         let bounds = Boundary::from_screen();
