@@ -203,7 +203,6 @@ async fn main() {
             5.0,
             WHITE,
         );
-
         next_frame().await
     }
 }
