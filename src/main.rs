@@ -125,8 +125,8 @@ impl Boundary {
 
 struct Simulation {
     positions: Vec<Vec2>,
+    predicted_positions: Vec<Vec2>,
     velocities: Vec<Vec2>,
-
     densities: Vec<f32>,
     settings: Settings,
     grid: SpatialGrid,
@@ -142,11 +142,20 @@ impl Simulation {
                 )
             })
             .collect();
+        let predicted_positions = (0..count)
+            .map(|_| {
+                Vec2::new(
+                    rand::gen_range(bounds.x_min, bounds.x_max),
+                    rand::gen_range(bounds.y_min, bounds.y_max),
+                )
+            })
+            .collect();
         let velocities = vec![Vec2::ZERO; count];
         let densities = vec![0.0; count];
         let grid = SpatialGrid::new(count * 4, settings.smoothing_radius);
         Self {
             positions,
+            predicted_positions,
             velocities,
             densities,
             settings,
@@ -155,11 +164,16 @@ impl Simulation {
     }
     fn new_grid(rows: usize, cols: usize, spacing: f32, settings: Settings) -> Self {
         let mut positions = Vec::new();
+        let mut predicted_positions = Vec::new();
         let start_x = screen_width() / 2.0 - (cols as f32 / 2.0) * spacing;
         let start_y = screen_height() / 2.0 - (rows as f32 / 2.0) * spacing;
         for row in 0..rows {
             for col in 0..cols {
                 positions.push(Vec2::new(
+                    start_x + col as f32 * spacing,
+                    start_y + row as f32 * spacing,
+                ));
+                predicted_positions.push(Vec2::new(
                     start_x + col as f32 * spacing,
                     start_y + row as f32 * spacing,
                 ));
@@ -171,6 +185,7 @@ impl Simulation {
         let grid = SpatialGrid::new(count * 4, settings.smoothing_radius);
         Self {
             positions,
+            predicted_positions,
             velocities,
             densities,
             settings,
@@ -178,30 +193,28 @@ impl Simulation {
         }
     }
     fn update_densities(&mut self, smoothing_radius: f32) {
-        let positions = &self.positions;
         let grid = &self.grid;
         self.densities
             .par_iter_mut()
             .enumerate()
             .for_each(|(i, density)| {
                 *density = Simulation::calculate_density_static(
-                    positions,
+                    &self.predicted_positions,
                     grid,
                     smoothing_radius,
-                    positions[i],
+                    self.predicted_positions[i],
                 );
             });
     }
     fn update_pressure(&mut self, dt: f32, smoothing_radius: f32) {
-        let positions = &self.positions;
         let densities = &self.densities;
         let settings = &self.settings;
 
-        let accelerations: Vec<Vec2> = (0..positions.len())
+        let accelerations: Vec<Vec2> = (0..self.predicted_positions.len())
             .into_par_iter()
             .map(|i| {
                 let force = Simulation::calculate_pressure_gradient_static(
-                    positions,
+                    &self.predicted_positions,
                     densities,
                     &self.grid,
                     settings,
@@ -221,10 +234,15 @@ impl Simulation {
         }
     }
     fn update(&mut self, dt: f32, bounds: &Boundary, smoothing_radius: f32) {
+        for i in 0..self.positions.len() {
+            self.predicted_positions[i] = self.positions[i] + self.velocities[i] * dt;
+        }
+
         self.grid.cell_size = self.settings.smoothing_radius;
-        self.grid.build(&self.positions);
+        self.grid.build(&self.predicted_positions);
         self.update_densities(smoothing_radius);
         self.update_pressure(dt, smoothing_radius);
+
         for i in 0..self.positions.len() {
             self.velocities[i].y -= self.settings.gravity * dt;
             self.velocities[i] *= self.settings.damping;
