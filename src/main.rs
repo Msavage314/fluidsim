@@ -86,7 +86,7 @@ impl Simulation {
             let pressureForce =
                 self.calculate_pressure_gradient(self.positions[i], smoothing_radius);
             let pressure_acceleration = pressureForce / self.densities[i];
-            self.velocities[i] += pressure_acceleration
+            self.velocities[i] -= pressure_acceleration
         }
         for i in 0..self.positions.len() {
             self.velocities[i].y -= GRAVITY * dt;
