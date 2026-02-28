@@ -1,11 +1,11 @@
-use std::{cmp, f32::consts::PI};
+use std::f32::consts::PI;
 
 use egui_macroquad::egui;
-use macroquad::{math, prelude::*};
+use macroquad::prelude::*;
 use rayon::prelude::*;
-const POINT_RADIUS: f32 = 5.0;
+const POINT_RADIUS: f32 = 3.0;
 const BORDER: f32 = 5.0;
-const PIXELS_PER_UNIT: f32 = 100.0;
+const PIXELS_PER_UNIT: f32 = 200.0;
 const MASS: f32 = 1.0;
 
 struct SpatialGrid {
@@ -87,9 +87,12 @@ struct Settings {
     smoothing_radius: f32,
     target_density: f32,
     pressure_multiplier: f32,
+    near_pressure_multiplier: f32,
     restitution: f32,
     speed_scale: f32,
     damping: f32,
+    mouse_radius: f32,
+    mouse_strength: f32,
 }
 
 impl Default for Settings {
@@ -99,9 +102,12 @@ impl Default for Settings {
             smoothing_radius: 50.0,
             target_density: 5.0,
             pressure_multiplier: 5.0,
+            near_pressure_multiplier: 5.0,
             restitution: 0.9,
             speed_scale: 300.0,
             damping: 1.0,
+            mouse_radius: 100.0,
+            mouse_strength: 500.0,
         }
     }
 }
@@ -130,11 +136,12 @@ struct Simulation {
     densities: Vec<f32>,
     settings: Settings,
     grid: SpatialGrid,
+    initial_positions: Vec<Vec2>,
 }
 
 impl Simulation {
     fn new_random(count: usize, bounds: &Boundary, settings: Settings) -> Self {
-        let positions = (0..count)
+        let positions: Vec<Vec2> = (0..count)
             .map(|_| {
                 Vec2::new(
                     rand::gen_range(bounds.x_min, bounds.x_max),
@@ -153,6 +160,7 @@ impl Simulation {
         let velocities = vec![Vec2::ZERO; count];
         let densities = vec![0.0; count];
         let grid = SpatialGrid::new(count * 4, settings.smoothing_radius);
+        let initial_positions = positions.clone();
         Self {
             positions,
             predicted_positions,
@@ -160,6 +168,7 @@ impl Simulation {
             densities,
             settings,
             grid,
+            initial_positions,
         }
     }
     fn new_grid(rows: usize, cols: usize, spacing: f32, settings: Settings) -> Self {
@@ -183,6 +192,7 @@ impl Simulation {
         let velocities = vec![Vec2::ZERO; count];
         let densities = vec![0.0; count];
         let grid = SpatialGrid::new(count * 4, settings.smoothing_radius);
+        let initial_positions = positions.clone();
         Self {
             positions,
             predicted_positions,
@@ -190,6 +200,42 @@ impl Simulation {
             densities,
             settings,
             grid,
+            initial_positions,
+        }
+    }
+    fn reset(&mut self, rows: usize, cols: usize, spacing: f32, bounds: &Boundary) {
+        let start_x = (bounds.x_max + bounds.x_min) / 2.0 - (cols as f32 / 2.0) * spacing;
+        let start_y = (bounds.y_max + bounds.y_min) / 2.0 - (rows as f32 / 2.0) * spacing;
+        self.positions.clear();
+        for row in 0..rows {
+            for col in 0..cols {
+                self.positions.push(Vec2::new(
+                    start_x + col as f32 * spacing,
+                    start_y + row as f32 * spacing,
+                ));
+            }
+        }
+        self.predicted_positions = self.positions.clone();
+        self.velocities = vec![Vec2::ZERO; self.positions.len()];
+        self.densities = vec![0.0; self.positions.len()];
+    }
+    fn apply_mouse_force(&mut self, mouse_pos: Vec2, dt: f32) {
+        let left = is_mouse_button_down(MouseButton::Left);
+        let right = is_mouse_button_down(MouseButton::Right);
+        if !left && !right {
+            return;
+        }
+
+        let direction = if left { 1.0 } else { -1.0 };
+
+        for i in 0..self.positions.len() {
+            let offset = mouse_pos - self.positions[i];
+            let dst = offset.length();
+            if dst < self.settings.mouse_radius && dst > 0.0 {
+                let strength =
+                    (1.0 - dst / self.settings.mouse_radius) * self.settings.mouse_strength;
+                self.velocities[i] += offset.normalize() * strength * direction * dt;
+            }
         }
     }
     fn update_densities(&mut self, smoothing_radius: f32) {
@@ -233,9 +279,9 @@ impl Simulation {
             self.velocities[i] -= accelerations[i] * dt;
         }
     }
-    fn update(&mut self, dt: f32, bounds: &Boundary, smoothing_radius: f32) {
+    fn update(&mut self, dt: f32, bounds: &Boundary, smoothing_radius: f32, mouse_pos: Vec2) {
         for i in 0..self.positions.len() {
-            self.predicted_positions[i] = self.positions[i] + self.velocities[i] * dt;
+            self.predicted_positions[i] = self.positions[i] + self.velocities[i] * 1.0 / 120.0;
         }
 
         self.grid.cell_size = self.settings.smoothing_radius;
@@ -254,6 +300,7 @@ impl Simulation {
                 self.settings.restitution,
             );
         }
+        self.apply_mouse_force(mouse_pos, dt);
     }
     fn calculate_density_static(
         positions: &[Vec2],
@@ -296,7 +343,11 @@ impl Simulation {
                 let pressure_b =
                     (sample_density - settings.target_density) * settings.pressure_multiplier;
                 let shared_pressure = (pressure_a + pressure_b) / 2.0;
-                pressure + (-shared_pressure * dir * slope * MASS / densities[i])
+                let near_pressure = densities[i] * settings.near_pressure_multiplier;
+                let slope2 = Simulation::near_pressure_kernel_derivative(scaled_radius, dst);
+                pressure
+                    + (-shared_pressure * dir * slope * MASS / densities[i])
+                    + (-near_pressure * dir * slope2 * MASS / densities[i])
             })
     }
     fn draw(&self, sample_point: Vec2, smoothing_radius: f32) {
@@ -312,7 +363,13 @@ impl Simulation {
                 color,
             );
         }
-        draw_circle_lines(sample_point.x, sample_point.y, smoothing_radius, 1.0, GREEN);
+        draw_circle_lines(
+            sample_point.x,
+            sample_point.y,
+            self.settings.mouse_radius,
+            1.0,
+            GREEN,
+        );
 
         let density = self.calculate_density(sample_point, smoothing_radius);
         draw_text(
@@ -358,6 +415,20 @@ impl Simulation {
         let scale = 12.0 / (PI * radius.powf(4.0));
         return (dst - radius) * scale;
     }
+    fn near_pressure_kernel(radius: f32, dst: f32) -> f32 {
+        if dst >= radius {
+            return 0.0;
+        }
+        let volume = PI * radius.powi(4) / 6.0;
+        (radius - dst).powi(3) / volume
+    }
+    fn near_pressure_kernel_derivative(radius: f32, dst: f32) -> f32 {
+        if dst >= radius {
+            return 0.0;
+        }
+        let scale = 12.0 / (PI * radius.powi(4));
+        -(radius - dst).powi(2) * scale
+    }
 
     fn calculate_density(&self, sample_point: Vec2, smoothing_radius: f32) -> f32 {
         let scale = 1.0 / PIXELS_PER_UNIT;
@@ -373,23 +444,49 @@ impl Simulation {
 
 #[macroquad::main("FluidSim")]
 async fn main() {
+    let rows = 100;
+    let cols = 100;
+    let spacing = 10.0;
     let bounds = Boundary::from_screen();
     let mut settings = Settings::default();
-    let mut sim = Simulation::new_random(5000, &bounds, settings);
+    let mut sim = Simulation::new_grid(rows, cols, spacing, settings);
+    let mut paused = false;
+    let mut step_frame = false;
     loop {
         let bounds = Boundary::from_screen();
-
         let scroll = mouse_wheel().1;
         if scroll != 0.0 {
-            sim.settings.smoothing_radius =
-                (sim.settings.smoothing_radius + scroll * 0.05).clamp(5.0, 300.0)
+            sim.settings.mouse_radius =
+                (sim.settings.mouse_radius + scroll * 0.05).clamp(5.0, 300.0)
         }
         let mouse_pos: Vec2 = mouse_position().into();
 
         clear_background(BLACK);
+        if is_key_pressed(KeyCode::Space) {
+            paused = !paused;
+        }
+        // Right arrow advances a single frame while paused
+        if is_key_pressed(KeyCode::Right) {
+            step_frame = true;
+        }
+        // R resets
+        if is_key_pressed(KeyCode::R) {
+            sim.reset(rows, cols, spacing, &bounds);
+        }
+
+        let should_update = !paused || step_frame;
+        step_frame = false;
+
+        if should_update {
+            sim.update(
+                get_frame_time(),
+                &bounds,
+                sim.settings.smoothing_radius,
+                mouse_pos,
+            );
+        }
 
         sim.draw(mouse_pos, sim.settings.smoothing_radius);
-        sim.update(get_frame_time(), &bounds, sim.settings.smoothing_radius);
 
         draw_rectangle_lines(
             5.0,
@@ -402,6 +499,23 @@ async fn main() {
 
         egui_macroquad::ui(|ctx| {
             egui::Window::new("Settings").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if paused { "▶ Play" } else { "⏸ Pause" })
+                        .clicked()
+                    {
+                        paused = !paused;
+                    }
+                    if ui
+                        .add_enabled(paused, egui::Button::new("⏭ Step"))
+                        .clicked()
+                    {
+                        step_frame = true;
+                    }
+                    if ui.button("↺ Reset").clicked() {
+                        sim.reset(rows, cols, spacing, &bounds);
+                    }
+                });
                 ui.add(
                     egui::Slider::new(&mut sim.settings.gravity, -500.0..=500.0).text("Gravity"),
                 );
@@ -425,6 +539,14 @@ async fn main() {
                         .text("Speed Colour Scale"),
                 );
                 ui.add(egui::Slider::new(&mut sim.settings.damping, 0.0..=1.0).text("Damping"));
+                ui.add(
+                    egui::Slider::new(&mut sim.settings.mouse_radius, 10.0..=300.0)
+                        .text("Mouse Radius"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut sim.settings.mouse_strength, 0.0..=2000.0)
+                        .text("Mouse Strength"),
+                );
             });
         });
         egui_macroquad::draw();
