@@ -3,6 +3,7 @@ use std::f32::consts::PI;
 use egui_macroquad::egui;
 use macroquad::prelude::*;
 use rayon::prelude::*;
+
 const POINT_RADIUS: f32 = 3.0;
 const BORDER: f32 = 5.0;
 const PIXELS_PER_UNIT: f32 = 200.0;
@@ -93,13 +94,14 @@ struct Settings {
     damping: f32,
     mouse_radius: f32,
     mouse_strength: f32,
+    viscosity_strength: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             gravity: 0.0,
-            smoothing_radius: 50.0,
+            smoothing_radius: 20.0,
             target_density: 5.0,
             pressure_multiplier: 5.0,
             near_pressure_multiplier: 5.0,
@@ -108,6 +110,7 @@ impl Default for Settings {
             damping: 1.0,
             mouse_radius: 100.0,
             mouse_strength: 500.0,
+            viscosity_strength: 10.0,
         }
     }
 }
@@ -232,9 +235,12 @@ impl Simulation {
             let offset = mouse_pos - self.positions[i];
             let dst = offset.length();
             if dst < self.settings.mouse_radius && dst > 0.0 {
-                let strength =
-                    (1.0 - dst / self.settings.mouse_radius) * self.settings.mouse_strength;
-                self.velocities[i] += offset.normalize() * strength * direction * dt;
+                // Sharper quadratic falloff
+                let t = 1.0 - (dst / self.settings.mouse_radius);
+                let strength = t * t * self.settings.mouse_strength;
+                // Pull directly toward cursor rather than just nudging
+                self.velocities[i] =
+                    self.velocities[i] * 0.7 + offset.normalize() * strength * direction;
             }
         }
     }
@@ -279,6 +285,33 @@ impl Simulation {
             self.velocities[i] -= accelerations[i] * dt;
         }
     }
+    fn update_viscosity(&mut self, dt: f32, smoothing_radius: f32) {
+        let densities = &self.densities;
+        let settings = &self.settings;
+
+        let accelerations: Vec<Vec2> = (0..self.predicted_positions.len())
+            .into_par_iter()
+            .map(|i| {
+                let force = Simulation::calculate_viscosity_force(
+                    &self.predicted_positions,
+                    &self.velocities,
+                    &self.grid,
+                    self.settings.viscosity_strength,
+                    i,
+                    smoothing_radius,
+                );
+                if densities[i] > 0.001 {
+                    force / densities[i]
+                } else {
+                    Vec2::ZERO
+                }
+            })
+            .collect();
+
+        for i in 0..self.velocities.len() {
+            self.velocities[i] -= accelerations[i] * dt;
+        }
+    }
     fn update(&mut self, dt: f32, bounds: &Boundary, smoothing_radius: f32, mouse_pos: Vec2) {
         for i in 0..self.positions.len() {
             self.predicted_positions[i] = self.positions[i] + self.velocities[i] * 1.0 / 120.0;
@@ -288,6 +321,7 @@ impl Simulation {
         self.grid.build(&self.predicted_positions);
         self.update_densities(smoothing_radius);
         self.update_pressure(dt, smoothing_radius);
+        self.update_viscosity(dt, smoothing_radius);
 
         for i in 0..self.positions.len() {
             self.velocities[i].y -= self.settings.gravity * dt;
@@ -343,11 +377,8 @@ impl Simulation {
                 let pressure_b =
                     (sample_density - settings.target_density) * settings.pressure_multiplier;
                 let shared_pressure = (pressure_a + pressure_b) / 2.0;
-                let near_pressure = densities[i] * settings.near_pressure_multiplier;
-                let slope2 = Simulation::near_pressure_kernel_derivative(scaled_radius, dst);
-                pressure
-                    + (-shared_pressure * dir * slope * MASS / densities[i])
-                    + (-near_pressure * dir * slope2 * MASS / densities[i])
+                pressure + (-shared_pressure * dir * slope * MASS / densities[i])
+                //+ (-near_pressure * dir * slope2 * MASS / densities[i])
             })
     }
     fn draw(&self, sample_point: Vec2, smoothing_radius: f32) {
@@ -409,25 +440,35 @@ impl Simulation {
         return (radius - dst) * (radius - dst) / volume;
     }
     fn smoothing_kernel_derivative(radius: f32, dst: f32) -> f32 {
-        if (dst >= radius) {
+        if dst >= radius {
             return 0.0;
         }
         let scale = 12.0 / (PI * radius.powf(4.0));
         return (dst - radius) * scale;
     }
-    fn near_pressure_kernel(radius: f32, dst: f32) -> f32 {
-        if dst >= radius {
-            return 0.0;
-        }
-        let volume = PI * radius.powi(4) / 6.0;
-        (radius - dst).powi(3) / volume
-    }
-    fn near_pressure_kernel_derivative(radius: f32, dst: f32) -> f32 {
-        if dst >= radius {
-            return 0.0;
-        }
-        let scale = 12.0 / (PI * radius.powi(4));
-        -(radius - dst).powi(2) * scale
+    fn calculate_viscosity_force(
+        positions: &[Vec2],
+        velocities: &[Vec2],
+        grid: &SpatialGrid,
+        viscosity_strength: f32,
+        particle_index: usize,
+        smoothing_radius: f32,
+    ) -> Vec2 {
+        let scale = 1.0 / PIXELS_PER_UNIT;
+        let scaled_radius = smoothing_radius * scale;
+        let sample_pos = positions[particle_index];
+
+        grid.query_neighbours(sample_pos)
+            .fold(Vec2::ZERO, |force, i| {
+                if i == particle_index {
+                    return force;
+                }
+                let dst = (positions[i] - sample_pos).length() * scale;
+                let influence = Simulation::smoothing_kernel(scaled_radius, dst);
+                let velocity_diff = velocities[i] - velocities[particle_index];
+                force + velocity_diff * influence
+            })
+            * viscosity_strength
     }
 
     fn calculate_density(&self, sample_point: Vec2, smoothing_radius: f32) -> f32 {
@@ -444,9 +485,9 @@ impl Simulation {
 
 #[macroquad::main("FluidSim")]
 async fn main() {
-    let rows = 100;
-    let cols = 100;
-    let spacing = 10.0;
+    let rows = 64;
+    let cols = 64;
+    let spacing = 20.0;
     let bounds = Boundary::from_screen();
     let mut settings = Settings::default();
     let mut sim = Simulation::new_grid(rows, cols, spacing, settings);
@@ -520,7 +561,7 @@ async fn main() {
                     egui::Slider::new(&mut sim.settings.gravity, -500.0..=500.0).text("Gravity"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut sim.settings.smoothing_radius, 5.0..=300.0)
+                    egui::Slider::new(&mut sim.settings.smoothing_radius, 5.0..=100.0)
                         .text("Smoothing Radius"),
                 );
                 ui.add(
@@ -546,6 +587,10 @@ async fn main() {
                 ui.add(
                     egui::Slider::new(&mut sim.settings.mouse_strength, 0.0..=2000.0)
                         .text("Mouse Strength"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut sim.settings.viscosity_strength, 0.0..=100.0)
+                        .text("Viscosity Strength"),
                 );
             });
         });
