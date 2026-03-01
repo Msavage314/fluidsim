@@ -4,9 +4,9 @@ use egui_macroquad::egui;
 use macroquad::prelude::*;
 use rayon::prelude::*;
 
-const POINT_RADIUS: f32 = 3.0;
+const POINT_RADIUS: f32 = 5.0;
 const BORDER: f32 = 5.0;
-const PIXELS_PER_UNIT: f32 = 200.0;
+const PIXELS_PER_UNIT: f32 = 100.0;
 const MASS: f32 = 1.0;
 
 struct SpatialGrid {
@@ -309,7 +309,7 @@ impl Simulation {
             .collect();
 
         for i in 0..self.velocities.len() {
-            self.velocities[i] -= accelerations[i] * dt;
+            self.velocities[i] += accelerations[i] * dt;
         }
     }
     fn update(&mut self, dt: f32, bounds: &Boundary, smoothing_radius: f32, mouse_pos: Vec2) {
@@ -368,7 +368,10 @@ impl Simulation {
                 let offset = positions[i] - sample_pos;
                 let dst = offset.length() * scale;
                 if dst == 0.0 || densities[i] < 0.001 {
-                    return pressure;
+                    // Apply a tiny random separation instead of returning zero
+                    let angle = rand::gen_range(0.0f32, std::f32::consts::TAU);
+                    let nudge = Vec2::new(angle.cos(), angle.sin()) * 0.001;
+                    return pressure + nudge;
                 }
                 let dir = offset.normalize();
                 let slope = Simulation::smoothing_kernel_derivative(scaled_radius, dst);
