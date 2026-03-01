@@ -136,7 +136,7 @@ struct Simulation {
     positions: Vec<Vec2>,
     predicted_positions: Vec<Vec2>,
     velocities: Vec<Vec2>,
-    densities: Vec<f32>,
+    densities: Vec<[f32; 2]>,
     settings: Settings,
     grid: SpatialGrid,
     initial_positions: Vec<Vec2>,
@@ -161,7 +161,7 @@ impl Simulation {
             })
             .collect();
         let velocities = vec![Vec2::ZERO; count];
-        let densities = vec![0.0; count];
+        let densities = vec![[0.0; 2]; count];
         let grid = SpatialGrid::new(count * 4, settings.smoothing_radius);
         let initial_positions = positions.clone();
         Self {
@@ -193,7 +193,7 @@ impl Simulation {
         }
         let count = positions.len();
         let velocities = vec![Vec2::ZERO; count];
-        let densities = vec![0.0; count];
+        let densities = vec![[0.0; 2]; count];
         let grid = SpatialGrid::new(count * 4, settings.smoothing_radius);
         let initial_positions = positions.clone();
         Self {
@@ -220,7 +220,7 @@ impl Simulation {
         }
         self.predicted_positions = self.positions.clone();
         self.velocities = vec![Vec2::ZERO; self.positions.len()];
-        self.densities = vec![0.0; self.positions.len()];
+        self.densities = vec![[0.0; 2]; self.positions.len()];
     }
     fn apply_mouse_force(&mut self, mouse_pos: Vec2, dt: f32) {
         let left = is_mouse_button_down(MouseButton::Left);
@@ -273,8 +273,8 @@ impl Simulation {
                     i,
                     smoothing_radius,
                 );
-                if densities[i] > 0.001 {
-                    force / densities[i]
+                if densities[i][0] > 0.001 {
+                    force / densities[i][0]
                 } else {
                     Vec2::ZERO
                 }
@@ -300,8 +300,8 @@ impl Simulation {
                     i,
                     smoothing_radius,
                 );
-                if densities[i] > 0.001 {
-                    force / densities[i]
+                if densities[i][0] > 0.001 {
+                    force / densities[i][0]
                 } else {
                     Vec2::ZERO
                 }
@@ -341,18 +341,23 @@ impl Simulation {
         grid: &SpatialGrid,
         smoothing_radius: f32,
         sample_point: Vec2,
-    ) -> f32 {
+    ) -> [f32; 2] {
         let scale = 1.0 / PIXELS_PER_UNIT;
         let scaled_radius = smoothing_radius * scale;
 
-        grid.query_neighbours(sample_point).fold(0.0, |density, i| {
-            let dst = (positions[i] * scale - sample_point * scale).length();
-            density + MASS * Simulation::smoothing_kernel(scaled_radius, dst)
-        })
+        return grid
+            .query_neighbours(sample_point)
+            .fold([0.0, 0.0], |[d, nd], i| {
+                let dst = (positions[i] * scale - sample_point * scale).length();
+                [
+                    d + MASS * Simulation::spiky_kernel_pow2(scaled_radius, dst),
+                    nd + MASS * Simulation::spiky_kernel_pow3(scaled_radius, dst),
+                ]
+            });
     }
     fn calculate_pressure_gradient_static(
         positions: &[Vec2],
-        densities: &[f32],
+        densities: &[[f32; 2]],
         grid: &SpatialGrid,
         settings: &Settings,
         sample_point_index: usize,
@@ -367,7 +372,7 @@ impl Simulation {
             .fold(Vec2::ZERO, |pressure, i| {
                 let offset = positions[i] - sample_pos;
                 let dst = offset.length() * scale;
-                if dst == 0.0 || densities[i] < 0.001 {
+                if dst == 0.0 || densities[i][0] < 0.001 {
                     // Apply a tiny random separation instead of returning zero
                     let angle = rand::gen_range(0.0f32, std::f32::consts::TAU);
                     let nudge = Vec2::new(angle.cos(), angle.sin()) * 0.001;
@@ -376,11 +381,26 @@ impl Simulation {
                 let dir = offset.normalize();
                 let slope = Simulation::smoothing_kernel_derivative(scaled_radius, dst);
                 let pressure_a =
-                    (densities[i] - settings.target_density) * settings.pressure_multiplier;
+                    (densities[i][0] - settings.target_density) * settings.pressure_multiplier;
                 let pressure_b =
-                    (sample_density - settings.target_density) * settings.pressure_multiplier;
+                    (sample_density[0] - settings.target_density) * settings.pressure_multiplier;
                 let shared_pressure = (pressure_a + pressure_b) / 2.0;
-                pressure + (-shared_pressure * dir * slope * MASS / densities[i])
+                let near_pressure_a = densities[i][1] * settings.near_pressure_multiplier;
+                let near_pressure_b =
+                    densities[sample_point_index][1] * settings.near_pressure_multiplier;
+                let shared_near_pressure = (near_pressure_a + near_pressure_b) / 2.0;
+
+                pressure
+                    + (-shared_pressure
+                        * dir
+                        * Simulation::spiky_kernel_pow2_derivative(scaled_radius, dst)
+                        * MASS
+                        / densities[i][0])
+                    + (-shared_near_pressure
+                        * dir
+                        * Simulation::spiky_kernel_pow3_derivative(scaled_radius, dst)
+                        * MASS
+                        / densities[i][1].max(0.001))
                 //+ (-near_pressure * dir * slope2 * MASS / densities[i])
             })
     }
@@ -413,6 +433,7 @@ impl Simulation {
             20.0,
             WHITE,
         );
+        draw_text(&format!("FPS: {}", get_fps()), 10.0, 20.0, 20.0, WHITE);
     }
     fn resolve_collisions(
         position: &mut Vec2,
@@ -472,6 +493,40 @@ impl Simulation {
                 force + velocity_diff * influence
             })
             * viscosity_strength
+    }
+    fn spiky_kernel_pow2(radius: f32, dst: f32) -> f32 {
+        if dst >= radius {
+            return 0.0;
+        }
+        let scale = 6.0 / (PI * radius.powf(4.0));
+        let v = radius - dst;
+        v * v * scale
+    }
+
+    fn spiky_kernel_pow2_derivative(radius: f32, dst: f32) -> f32 {
+        if dst >= radius {
+            return 0.0;
+        }
+        let scale = 12.0 / (PI * radius.powf(4.0));
+        (dst - radius) * scale
+    }
+
+    fn spiky_kernel_pow3(radius: f32, dst: f32) -> f32 {
+        if dst >= radius {
+            return 0.0;
+        }
+        let scale = 10.0 / (PI * radius.powf(5.0));
+        let v = radius - dst;
+        v * v * v * scale
+    }
+
+    fn spiky_kernel_pow3_derivative(radius: f32, dst: f32) -> f32 {
+        if dst >= radius {
+            return 0.0;
+        }
+        let scale = 30.0 / (PI * radius.powf(5.0));
+        let v = radius - dst;
+        -(v * v) * scale
     }
 
     fn calculate_density(&self, sample_point: Vec2, smoothing_radius: f32) -> f32 {
@@ -572,7 +627,7 @@ async fn main() {
                         .text("Target Density"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut sim.settings.pressure_multiplier, 0.0..=500.0)
+                    egui::Slider::new(&mut sim.settings.pressure_multiplier, 0.0..=1000.0)
                         .text("Pressure Multiplier"),
                 );
                 ui.add(
@@ -594,6 +649,10 @@ async fn main() {
                 ui.add(
                     egui::Slider::new(&mut sim.settings.viscosity_strength, 0.0..=100.0)
                         .text("Viscosity Strength"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut sim.settings.near_pressure_multiplier, 0.0..=100.0)
+                        .text("Near pressure"),
                 );
             });
         });
