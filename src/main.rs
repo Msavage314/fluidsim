@@ -62,23 +62,21 @@ impl SpatialGrid {
     }
     fn query_neighbours<'a>(&'a self, pos: Vec2) -> impl Iterator<Item = usize> + 'a {
         let (cx, cy) = self.cell_coord(pos);
-        let cell_size = self.cell_size;
-
         (-1i32..=1)
             .flat_map(move |dx| (-1i32..=1).map(move |dy| (cx + dx, cy + dy)))
             .flat_map(move |(nx, ny)| {
                 let key = self.hash_cell(nx, ny) as usize;
-                let start = self.cell_starts[key];
-                if start == u32::MAX {
-                    return vec![];
-                }
-                let mut result = vec![];
-                let mut idx = start as usize;
-                while idx < self.cell_keys.len() && self.cell_keys[idx] == key as u32 {
-                    result.push(self.particle_indices[idx]);
-                    idx += 1;
-                }
-                result
+                let start = self.cell_starts[key] as usize;
+                (start != u32::MAX as usize)
+                    .then(|| {
+                        let end = self.cell_keys[start..]
+                            .iter()
+                            .position(|&k| k != key as u32)
+                            .map_or(self.cell_keys.len(), |p| start + p);
+                        self.particle_indices[start..end].iter().copied()
+                    })
+                    .into_iter()
+                    .flatten()
             })
     }
 }
@@ -102,15 +100,15 @@ impl Default for Settings {
         Self {
             gravity: 0.0,
             smoothing_radius: 20.0,
-            target_density: 5.0,
-            pressure_multiplier: 5.0,
-            near_pressure_multiplier: 5.0,
+            target_density: 15.0,
+            pressure_multiplier: 500.0,
+            near_pressure_multiplier: 500.0,
             restitution: 0.9,
             speed_scale: 300.0,
-            damping: 1.0,
+            damping: 0.99,
             mouse_radius: 100.0,
             mouse_strength: 500.0,
-            viscosity_strength: 10.0,
+            viscosity_strength: 30.0,
         }
     }
 }
@@ -379,7 +377,6 @@ impl Simulation {
                     return pressure + nudge;
                 }
                 let dir = offset.normalize();
-                let slope = Simulation::smoothing_kernel_derivative(scaled_radius, dst);
                 let pressure_a =
                     (densities[i][0] - settings.target_density) * settings.pressure_multiplier;
                 let pressure_b =
@@ -545,7 +542,7 @@ impl Simulation {
 async fn main() {
     let rows = 64;
     let cols = 64;
-    let spacing = 20.0;
+    let spacing = 5.0;
     let bounds = Boundary::from_screen();
     let mut settings = Settings::default();
     let mut sim = Simulation::new_grid(rows, cols, spacing, settings);
@@ -639,7 +636,7 @@ async fn main() {
                 );
                 ui.add(egui::Slider::new(&mut sim.settings.damping, 0.0..=1.0).text("Damping"));
                 ui.add(
-                    egui::Slider::new(&mut sim.settings.mouse_radius, 10.0..=300.0)
+                    egui::Slider::new(&mut sim.settings.mouse_radius, 10.0..=500.0)
                         .text("Mouse Radius"),
                 );
                 ui.add(
@@ -651,7 +648,7 @@ async fn main() {
                         .text("Viscosity Strength"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut sim.settings.near_pressure_multiplier, 0.0..=100.0)
+                    egui::Slider::new(&mut sim.settings.near_pressure_multiplier, 0.0..=1000.0)
                         .text("Near pressure"),
                 );
             });
