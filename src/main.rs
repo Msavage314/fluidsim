@@ -9,92 +9,29 @@ const BORDER: f32 = 5.0;
 const PIXELS_PER_UNIT: f32 = 100.0;
 const MASS: f32 = 1.0;
 
-struct SpatialGrid {
-    cell_size: f32,
-    particle_indices: Vec<usize>,
-    cell_keys: Vec<u32>,
-    cell_starts: Vec<u32>,
-    table_size: usize,
-}
-impl SpatialGrid {
-    fn new(table_size: usize, cell_size: f32) -> Self {
-        Self {
-            cell_size,
-            particle_indices: Vec::new(),
-            cell_keys: Vec::new(),
-            cell_starts: vec![u32::MAX; table_size],
-            table_size,
-        }
-    }
-    fn cell_coord(&self, pos: Vec2) -> (i32, i32) {
-        return (
-            (pos.x / self.cell_size).floor() as i32,
-            (pos.y / self.cell_size).floor() as i32,
-        );
-    }
-    fn hash_cell(&self, cx: i32, cy: i32) -> u32 {
-        let a = cx.wrapping_mul(92837111) as u32;
-        let b = cy.wrapping_mul(689287499) as u32;
-        (a ^ b) % self.table_size as u32
-    }
-
-    fn build(&mut self, positions: &[Vec2]) {
-        let n = positions.len();
-        let mut pairs: Vec<(usize, u32)> = positions
-            .iter()
-            .enumerate()
-            .map(|(i, pos)| {
-                let (cx, cy) = self.cell_coord(*pos);
-                (i, self.hash_cell(cx, cy))
-            })
-            .collect();
-
-        pairs.sort_unstable_by_key(|&(_, key)| key);
-
-        self.particle_indices = pairs.iter().map(|&(i, _)| i).collect();
-        self.cell_keys = pairs.iter().map(|&(_, k)| k).collect();
-        self.cell_starts.fill(u32::MAX);
-        for (sorted_pos, &key) in self.cell_keys.iter().enumerate() {
-            if sorted_pos == 0 || self.cell_keys[sorted_pos - 1] != key {
-                self.cell_starts[key as usize] = sorted_pos as u32;
-            }
-        }
-    }
-    fn query_neighbours<'a>(&'a self, pos: Vec2) -> impl Iterator<Item = usize> + 'a {
-        let (cx, cy) = self.cell_coord(pos);
-        (-1i32..=1)
-            .flat_map(move |dx| (-1i32..=1).map(move |dy| (cx + dx, cy + dy)))
-            .flat_map(move |(nx, ny)| {
-                let key = self.hash_cell(nx, ny) as usize;
-                let start = self.cell_starts[key] as usize;
-                (start != u32::MAX as usize)
-                    .then(|| {
-                        let end = self.cell_keys[start..]
-                            .iter()
-                            .position(|&k| k != key as u32)
-                            .map_or(self.cell_keys.len(), |p| start + p);
-                        self.particle_indices[start..end].iter().copied()
-                    })
-                    .into_iter()
-                    .flatten()
-            })
-    }
-}
-
 struct Settings {
     gravity: f32,
+    mouse_radius: f32,
+    mouse_strength: f32,
+
     smoothing_radius: f32,
     target_density: f32,
     pressure_multiplier: f32,
     near_pressure_multiplier: f32,
     restitution: f32,
-    speed_scale: f32,
     damping: f32,
-    mouse_radius: f32,
-    mouse_strength: f32,
+    speed_scale: f32,
     viscosity_strength: f32,
-}
+    mass: f32,
 
+    pixels_per_unit: f32,
+    point_radius: f32,
+    border_size: f32,
+
+    rows: usize,
+    cols: usize,
+    spacing: f32,
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -109,23 +46,13 @@ impl Default for Settings {
             mouse_radius: 100.0,
             mouse_strength: 500.0,
             viscosity_strength: 30.0,
-        }
-    }
-}
-struct Boundary {
-    x_min: f32,
-    x_max: f32,
-    y_min: f32,
-    y_max: f32,
-}
-
-impl Boundary {
-    fn from_screen() -> Self {
-        Self {
-            x_min: BORDER + POINT_RADIUS,
-            x_max: screen_width() - BORDER - POINT_RADIUS,
-            y_min: BORDER + POINT_RADIUS,
-            y_max: screen_height() - BORDER - POINT_RADIUS,
+            border_size: 5.0,
+            mass: 1.0,
+            pixels_per_unit: 100.0,
+            point_radius: 5.0,
+            rows: 10,
+            cols: 10,
+            spacing: 5.0,
         }
     }
 }
@@ -204,7 +131,10 @@ impl Simulation {
             initial_positions,
         }
     }
-    fn reset(&mut self, rows: usize, cols: usize, spacing: f32, bounds: &Boundary) {
+    fn reset(&mut self, bounds: &Boundary) {
+        let rows = self.settings.rows;
+        let cols = self.settings.cols;
+        let spacing = self.settings.spacing;
         let start_x = (bounds.x_max + bounds.x_min) / 2.0 - (cols as f32 / 2.0) * spacing;
         let start_y = (bounds.y_max + bounds.y_min) / 2.0 - (rows as f32 / 2.0) * spacing;
         self.positions.clear();
@@ -236,9 +166,9 @@ impl Simulation {
                 // Sharper quadratic falloff
                 let t = 1.0 - (dst / self.settings.mouse_radius);
                 let strength = t * t * self.settings.mouse_strength;
-                // Pull directly toward cursor rather than just nudging
-                self.velocities[i] =
-                    self.velocities[i] * 0.7 + offset.normalize() * strength * direction;
+                let drag = self.velocities[i] * t; // t = proximity factor
+                let attraction = offset.normalize() * strength * direction * t;
+                self.velocities[i] += (attraction - drag) * dt;
             }
         }
     }
@@ -311,18 +241,22 @@ impl Simulation {
         }
     }
     fn update(&mut self, dt: f32, bounds: &Boundary, smoothing_radius: f32, mouse_pos: Vec2) {
+        // 1. Apply gravity and predict
         for i in 0..self.positions.len() {
-            self.predicted_positions[i] = self.positions[i] + self.velocities[i] * 1.0 / 120.0;
+            self.velocities[i].y += self.settings.gravity * dt;
+            self.predicted_positions[i] = self.positions[i] + self.velocities[i] * (1.0 / 120.0);
         }
 
+        // 2. Build grid and compute forces on predicted state
         self.grid.cell_size = self.settings.smoothing_radius;
         self.grid.build(&self.predicted_positions);
         self.update_densities(smoothing_radius);
         self.update_pressure(dt, smoothing_radius);
         self.update_viscosity(dt, smoothing_radius);
+        self.apply_mouse_force(mouse_pos, dt);
 
+        // 3. Integrate positions and resolve collisions
         for i in 0..self.positions.len() {
-            self.velocities[i].y -= self.settings.gravity * dt;
             self.velocities[i] *= self.settings.damping;
             self.positions[i] += self.velocities[i] * dt;
             Simulation::resolve_collisions(
@@ -332,7 +266,6 @@ impl Simulation {
                 self.settings.restitution,
             );
         }
-        self.apply_mouse_force(mouse_pos, dt);
     }
     fn calculate_density_static(
         positions: &[Vec2],
@@ -430,6 +363,15 @@ impl Simulation {
             20.0,
             WHITE,
         );
+        let average_density: f32 =
+            self.densities.iter().map(|x| x[0]).sum::<f32>() / self.densities.len() as f32;
+        draw_text(
+            &format!("density: {}", average_density),
+            100.0,
+            20.0,
+            20.0,
+            WHITE,
+        );
         draw_text(&format!("FPS: {}", get_fps()), 10.0, 20.0, 20.0, WHITE);
     }
     fn resolve_collisions(
@@ -485,7 +427,7 @@ impl Simulation {
                     return force;
                 }
                 let dst = (positions[i] - sample_pos).length() * scale;
-                let influence = Simulation::smoothing_kernel(scaled_radius, dst);
+                let influence = Simulation::poly6_kernel(scaled_radius, dst);
                 let velocity_diff = velocities[i] - velocities[particle_index];
                 force + velocity_diff * influence
             })
@@ -525,6 +467,14 @@ impl Simulation {
         let v = radius - dst;
         -(v * v) * scale
     }
+    fn poly6_kernel(radius: f32, dst: f32) -> f32 {
+        if dst >= radius {
+            return 0.0;
+        }
+        let scale = 4.0 / (PI * radius.powf(8.0));
+        let v = radius * radius - dst * dst;
+        v * v * v * scale
+    }
 
     fn calculate_density(&self, sample_point: Vec2, smoothing_radius: f32) -> f32 {
         let scale = 1.0 / PIXELS_PER_UNIT;
@@ -540,12 +490,8 @@ impl Simulation {
 
 #[macroquad::main("FluidSim")]
 async fn main() {
-    let rows = 64;
-    let cols = 64;
-    let spacing = 5.0;
-    let bounds = Boundary::from_screen();
     let mut settings = Settings::default();
-    let mut sim = Simulation::new_grid(rows, cols, spacing, settings);
+    let mut sim = Simulation::new_grid(settings.rows, settings.cols, settings.spacing, settings);
     let mut paused = false;
     let mut step_frame = false;
     loop {
@@ -565,9 +511,10 @@ async fn main() {
         if is_key_pressed(KeyCode::Right) {
             step_frame = true;
         }
+
         // R resets
         if is_key_pressed(KeyCode::R) {
-            sim.reset(rows, cols, spacing, &bounds);
+            sim.reset(&bounds);
         }
 
         let should_update = !paused || step_frame;
@@ -609,7 +556,7 @@ async fn main() {
                         step_frame = true;
                     }
                     if ui.button("↺ Reset").clicked() {
-                        sim.reset(rows, cols, spacing, &bounds);
+                        sim.reset(&bounds);
                     }
                 });
                 ui.add(
@@ -624,7 +571,7 @@ async fn main() {
                         .text("Target Density"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut sim.settings.pressure_multiplier, 0.0..=1000.0)
+                    egui::Slider::new(&mut sim.settings.pressure_multiplier, 0.0..=10000.0)
                         .text("Pressure Multiplier"),
                 );
                 ui.add(
@@ -651,9 +598,100 @@ async fn main() {
                     egui::Slider::new(&mut sim.settings.near_pressure_multiplier, 0.0..=1000.0)
                         .text("Near pressure"),
                 );
+                ui.add(egui::Slider::new(&mut sim.settings.rows, 0..=200).text("rows"));
+                ui.add(egui::Slider::new(&mut sim.settings.cols, 0..=200).text("cols"));
             });
         });
         egui_macroquad::draw();
         next_frame().await
+    }
+}
+struct SpatialGrid {
+    cell_size: f32,
+    particle_indices: Vec<usize>,
+    cell_keys: Vec<u32>,
+    cell_starts: Vec<u32>,
+    table_size: usize,
+}
+impl SpatialGrid {
+    fn new(table_size: usize, cell_size: f32) -> Self {
+        Self {
+            cell_size,
+            particle_indices: Vec::new(),
+            cell_keys: Vec::new(),
+            cell_starts: vec![u32::MAX; table_size],
+            table_size,
+        }
+    }
+    fn cell_coord(&self, pos: Vec2) -> (i32, i32) {
+        return (
+            (pos.x / self.cell_size).floor() as i32,
+            (pos.y / self.cell_size).floor() as i32,
+        );
+    }
+    fn hash_cell(&self, cx: i32, cy: i32) -> u32 {
+        let a = cx.wrapping_mul(92837111) as u32;
+        let b = cy.wrapping_mul(689287499) as u32;
+        (a ^ b) % self.table_size as u32
+    }
+
+    fn build(&mut self, positions: &[Vec2]) {
+        let n = positions.len();
+        let mut pairs: Vec<(usize, u32)> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, pos)| {
+                let (cx, cy) = self.cell_coord(*pos);
+                (i, self.hash_cell(cx, cy))
+            })
+            .collect();
+
+        pairs.sort_unstable_by_key(|&(_, key)| key);
+
+        self.particle_indices = pairs.iter().map(|&(i, _)| i).collect();
+        self.cell_keys = pairs.iter().map(|&(_, k)| k).collect();
+        self.cell_starts.fill(u32::MAX);
+        for (sorted_pos, &key) in self.cell_keys.iter().enumerate() {
+            if sorted_pos == 0 || self.cell_keys[sorted_pos - 1] != key {
+                self.cell_starts[key as usize] = sorted_pos as u32;
+            }
+        }
+    }
+    fn query_neighbours<'a>(&'a self, pos: Vec2) -> impl Iterator<Item = usize> + 'a {
+        let (cx, cy) = self.cell_coord(pos);
+        (-1i32..=1)
+            .flat_map(move |dx| (-1i32..=1).map(move |dy| (cx + dx, cy + dy)))
+            .flat_map(move |(nx, ny)| {
+                let key = self.hash_cell(nx, ny) as usize;
+                let start = self.cell_starts[key] as usize;
+                (start != u32::MAX as usize)
+                    .then(|| {
+                        let end = self.cell_keys[start..]
+                            .iter()
+                            .position(|&k| k != key as u32)
+                            .map_or(self.cell_keys.len(), |p| start + p);
+                        self.particle_indices[start..end].iter().copied()
+                    })
+                    .into_iter()
+                    .flatten()
+            })
+    }
+}
+
+struct Boundary {
+    x_min: f32,
+    x_max: f32,
+    y_min: f32,
+    y_max: f32,
+}
+
+impl Boundary {
+    fn from_screen() -> Self {
+        Self {
+            x_min: BORDER + POINT_RADIUS,
+            x_max: screen_width() - BORDER - POINT_RADIUS,
+            y_min: BORDER + POINT_RADIUS,
+            y_max: screen_height() - BORDER - POINT_RADIUS,
+        }
     }
 }
